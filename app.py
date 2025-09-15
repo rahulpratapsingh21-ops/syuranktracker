@@ -3,6 +3,9 @@ import requests
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse
+import time
+from random import randint
+
 
 # Function to get user's country based on IP
 def get_user_country():
@@ -10,8 +13,10 @@ def get_user_country():
         response = requests.get("https://ipinfo.io/json")
         data = response.json()
         return data.get("country", "")
-    except:
+    except Exception as e:
+        print(f"Error in get_user_country: {e}")
         return None
+
 
 # Normalize URLs for comparison
 def normalize_netloc(link):
@@ -21,6 +26,7 @@ def normalize_netloc(link):
         netloc = netloc[4:]
     return netloc
 
+
 # Validate API key (optional, improves UX)
 def validate_api_key(api_key):
     try:
@@ -28,10 +34,12 @@ def validate_api_key(api_key):
         payload = {"q": "test", "gl": "in", "hl": "en", "num": 1}
         r = requests.post("https://google.serper.dev/search", headers=headers, json=payload, timeout=10)
         return r.status_code == 200
-    except:
+    except Exception as e:
+        print(f"Error in validate_api_key: {e}")
         return False
 
-# Main function to check ranking
+
+# Modify check_domain_ranking to handle 429 errors and log better results
 def check_domain_ranking(api_key, keyword, gl, domain, google_domain=None, hl=None,
                          location="India", device="desktop", search_type="search", strict=False):
     url = "https://google.serper.dev/search"
@@ -50,31 +58,57 @@ def check_domain_ranking(api_key, keyword, gl, domain, google_domain=None, hl=No
     if google_domain:
         payload["google_domain"] = google_domain
 
-    try:
-        response = requests.post(url, headers=headers, json=payload, timeout=30)
-        if response.status_code == 403:
-            return keyword, location, "❌ Invalid API key (403)", None
-        elif response.status_code != 200:
-            return keyword, location, f"❌ API Error {response.status_code}", None
+    retries = 5  # Number of retry attempts
+    delay = 5  # Starting delay in seconds
 
-        data = response.json()
-        organic_results = data.get("organic") or data.get("organic_results") or []
+    for attempt in range(retries):
+        try:
+            print(f"Requesting for keyword: {keyword} (Attempt {attempt + 1})")
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
 
-        normalized_domain = domain.lower().replace("www.", "").strip()
+            # Log the status code and the response content for debugging
+            print(f"Attempt {attempt + 1} - Status Code: {response.status_code}")
 
-        for i, item in enumerate(organic_results, 1):
-            link = item.get("link") or item.get("url") or ""
-            if not link:
-                continue
+            if response.status_code == 403:
+                print(f"Invalid API key (403) for keyword: {keyword}")
+                return keyword, location, "❌ Invalid API key (403)", None
+            elif response.status_code == 429:  # Rate limit exceeded
+                wait_time = delay * (2 ** attempt) + randint(0, 3)  # Exponential backoff
+                print(f"Rate limit hit. Retrying in {wait_time} seconds...")
+                time.sleep(wait_time)  # Wait before retrying
+                continue  # Retry the request
+            elif response.status_code != 200:
+                print(f"API Error {response.status_code} for keyword: {keyword}")
+                return keyword, location, f"❌ API Error {response.status_code}", None
 
-            netloc = normalize_netloc(link)
-            if (strict and netloc == normalized_domain) or (not strict and normalized_domain in netloc):
-                return keyword, location, i, link
+            # If the response is successful, proceed with parsing the results
+            data = response.json()
+            organic_results = data.get("organic") or data.get("organic_results") or []
 
-        return keyword, location, "Not in Top 100", None
+            normalized_domain = domain.lower().replace("www.", "").strip()
 
-    except Exception as e:
-        return keyword, location, f"Error: {e}", None
+            # Loop through results and check if the domain matches
+            for i, item in enumerate(organic_results, 1):
+                link = item.get("link") or item.get("url") or ""
+                if not link:
+                    continue
+
+                netloc = normalize_netloc(link)
+                if (strict and netloc == normalized_domain) or (not strict and normalized_domain in netloc):
+                    print(f"Found {keyword} at position {i}: {link}")
+                    return keyword, location, i, link
+
+            print(f"{keyword} not found in top 100 results.")
+            return keyword, location, "Not in Top 100", None
+
+        except Exception as e:
+            print(f"Error during request for keyword '{keyword}': {e}")
+            return keyword, location, f"Error: {e}", None
+
+    # After retries are exhausted, return an error message
+    print(f"Max retries exceeded for keyword: {keyword}")
+    return keyword, location, "❌ Rate limit exceeded. Please try again later.", None
+
 
 # ------------------------ Streamlit App ------------------------
 
@@ -140,14 +174,27 @@ if submitted:
             completed = 0
             for future in as_completed(futures):
                 completed += 1
-                results.append(future.result())
+                result = future.result()
+                results.append(result)
+
+                # REMOVE or COMMENT OUT this line to prevent individual results from being shown
+                # st.write(f"Result for {result[0]}: {result[2]} - {result[3]}")
+
                 progress_bar.progress(completed / total)
 
-        df = pd.DataFrame(results, columns=["Keyword", "Location", "Ranking", "URL"])
-        st.subheader("📊 Domain Ranking Results (India)")
-        st.dataframe(df, use_container_width=True)
-        st.download_button("⬇ Download CSV", data=df.to_csv(index=False), file_name="rankings.csv", mime="text/csv")
+        # Filter out keywords that are not in the top 100
+        ranked_results = [result for result in results if result[2] != "Not in Top 100"]
+
+        if ranked_results:
+            st.subheader("📊 Domain Ranking Results (India) - Keywords in Top 100")
+            df = pd.DataFrame(ranked_results, columns=["Keyword", "Location", "Ranking", "URL"])
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.warning("⚠ No keywords found in the top 100.")
+
+        st.download_button("⬇ Download CSV",
+                           data=pd.DataFrame(results, columns=["Keyword", "Location", "Ranking", "URL"]).to_csv(
+                               index=False), file_name="rankings.csv", mime="text/csv")
 
         if any("403" in str(r[2]) for r in results):
             st.warning("⚠ Some keywords returned a 403 error. Please check your API key quota or plan.")
-
